@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bet Edge — Daily Picks</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0e1a; color: #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+
+  header { background: #0f1628; border-bottom: 1px solid #1e2d4a; padding: 18px 32px; display: flex; align-items: center; justify-content: space-between; }
+  .logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+  .logo span { color: #3b82f6; }
+  .header-meta { font-size: 13px; color: #64748b; }
+  .live-dot { display: inline-block; width: 8px; height: 8px; background: #22c55e; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+  .page-title { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+  .page-sub { color: #64748b; font-size: 15px; margin-bottom: 32px; }
+
+  .sport-tabs { display: flex; gap: 8px; margin-bottom: 28px; }
+  .tab { padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; border: 1px solid #1e2d4a; background: transparent; color: #64748b; transition: all 0.15s; }
+  .tab.active { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+
+  .picks-grid { display: grid; gap: 14px; }
+
+  .pick-card { background: #0f1628; border: 1px solid #1e2d4a; border-radius: 12px; padding: 20px 24px; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; transition: border-color 0.15s; }
+  .pick-card:hover { border-color: #2d4a7a; }
+  .pick-card.strong { border-left: 3px solid #3b82f6; }
+
+  .pick-left {}
+  .player-name { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+  .pick-meta { font-size: 13px; color: #64748b; margin-bottom: 12px; }
+  .pick-detail { display: flex; gap: 20px; font-size: 13px; }
+  .pick-detail span { color: #94a3b8; }
+  .pick-detail strong { color: #e2e8f0; }
+
+  .prob-bar { margin-top: 12px; height: 4px; background: #1e2d4a; border-radius: 2px; overflow: hidden; }
+  .prob-fill { height: 100%; background: #3b82f6; border-radius: 2px; transition: width 0.6s ease; }
+
+  .pick-right { text-align: right; }
+  .edge-badge { display: inline-block; padding: 6px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .edge-badge.strong { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
+  .edge-badge.value  { background: rgba(34,197,94,0.12); color: #4ade80; border: 1px solid rgba(34,197,94,0.25); }
+
+  .side-label { font-size: 22px; font-weight: 800; letter-spacing: 0.5px; }
+  .side-label.OVER  { color: #4ade80; }
+  .side-label.UNDER { color: #f87171; }
+  .ev-label { font-size: 12px; color: #64748b; margin-top: 4px; }
+  .ev-label strong { color: #94a3b8; }
+
+  .line-info { font-size: 13px; color: #64748b; margin-top: 6px; }
+  .proj-line { font-size: 13px; color: #3b82f6; margin-top: 2px; font-weight: 500; }
+
+  .demo-banner { background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; padding: 14px 20px; margin-bottom: 28px; font-size: 14px; color: #fbbf24; }
+  .demo-banner a { color: #fbbf24; font-weight: 600; }
+
+  .empty { text-align: center; padding: 60px; color: #64748b; }
+
+  .loading { text-align: center; padding: 60px; }
+  .spinner { width: 36px; height: 36px; border: 3px solid #1e2d4a; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .updated { font-size: 12px; color: #475569; text-align: right; margin-top: 24px; }
+  .weights-info { font-size: 12px; color: #334155; margin-top: 8px; text-align: right; }
+
+  @media (max-width: 600px) {
+    .pick-card { grid-template-columns: 1fr; }
+    .pick-right { text-align: left; display: flex; gap: 16px; align-items: center; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Bet<span>Edge</span></div>
+  <div class="header-meta"><span class="live-dot"></span>Live Picks — NBA</div>
+</header>
+
+<div class="container">
+  <div class="page-title" id="page-date">Loading...</div>
+  <div class="page-sub">Edge-based picks updated throughout the day. Only surfacing plays where the model finds real value.</div>
+
+  <div class="sport-tabs">
+    <button class="tab active" onclick="switchSport('NBA', this)">NBA</button>
+    <button class="tab" onclick="switchSport('MLB', this)">MLB</button>
+    <button class="tab" onclick="switchSport('NHL', this)">NHL</button>
+    <button class="tab" onclick="switchSport('ALL', this)">All Sports</button>
+    <button class="tab" style="opacity:0.4;cursor:default">Soccer — soon</button>
+  </div>
+
+  <div id="demo-banner" style="display:none" class="demo-banner">
+    ⚡ Running in demo mode — real picks require an Odds API key.
+    <a href="https://the-odds-api.com" target="_blank">Get your free key →</a>
+    Then set <code>ODDS_API_KEY=your_key</code> and restart.
+  </div>
+
+  <div id="picks-container">
+    <div class="loading">
+      <div class="spinner"></div>
+      <div style="color:#64748b;font-size:14px">Loading today's picks...</div>
+    </div>
+  </div>
+
+  <div class="updated" id="updated-time"></div>
+  <div class="weights-info" id="weights-info"></div>
+</div>
+
+<script>
+let currentSport = 'NBA';
+
+function switchSport(sport, btn) {
+  currentSport = sport;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  loadPicks();
+}
+
+async function loadPicks() {
+  document.getElementById('picks-container').innerHTML = '<div class="loading"><div class="spinner"></div><div style="color:#64748b;font-size:14px">Loading ' + currentSport + ' picks...</div></div>';
+  try {
+    const res  = await fetch('/api/picks?sport=' + currentSport);
+    const data = await res.json();
+
+    document.getElementById('page-date').textContent = data.date + ' — Top Picks';
+    document.getElementById('updated-time').textContent = 'Last updated: ' + data.updated + (data.next_refresh ? '  ·  ' + data.next_refresh : '');
+    document.getElementById('weights-info').textContent =
+      'Model weights: Season 20% · L10 25% · L5 30% · Matchup 15% · External 10%';
+
+    if (data.demo_mode) {
+      document.getElementById('demo-banner').style.display = 'block';
+    }
+
+    const container = document.getElementById('picks-container');
+
+    if (!data.picks || data.picks.length === 0) {
+      container.innerHTML = '<div class="empty">No games found for ' + currentSport + ' today. Try another sport or check back later.</div>';
+      return;
+    }
+
+    container.innerHTML = '<div class="picks-grid">' +
+      data.picks.map(p => renderCard(p)).join('') +
+    '</div>';
+
+    // Animate bars
+    requestAnimationFrame(() => {
+      document.querySelectorAll('.prob-fill').forEach(el => {
+        el.style.width = el.dataset.width + '%';
+      });
+    });
+  } catch (e) {
+    document.getElementById('picks-container').innerHTML =
+      '<div class="empty">Could not load picks. Make sure the server is running.</div>';
+  }
+}
+
+function renderCard(p) {
+  const trueProb  = p.best_side === 'OVER' ? p.p_over : p.p_under;
+  const impProb   = p.best_side === 'OVER' ? p.imp_over : p.imp_under;
+  const badgeClass = p.strength === 'strong' ? 'strong' : 'value';
+  const badgeText  = p.strength === 'strong' ? '🔥 Strong Edge +' + p.edge + '%' : p.edge >= 2 ? '✅ Edge +' + p.edge + '%' : '📊 Lean +' + p.edge + '%';
+
+  return `
+    <div class="pick-card ${p.strength === 'strong' ? 'strong' : ''}">
+      <div class="pick-left">
+        <div class="player-name">${p.player}</div>
+        <div class="pick-meta">${p.sport ? '<span style="color:#3b82f6;font-weight:600">' + p.sport + '</span> · ' : ''}${p.stat}${p.line ? ' · Line: ' + p.line : ''}${p.matchup && p.matchup !== p.player ? ' · ' + p.matchup : ''}</div>
+        <div class="pick-detail">
+          <div><span>Projection </span><strong>${p.projection}</strong></div>
+          <div><span>Consensus </span><strong>${trueProb}%</strong></div>
+          <div><span>Best odds implied </span><strong>${impProb}%</strong></div>
+          <div><span>EV per $100 </span><strong style="color:${p.ev >= 0 ? '#4ade80' : '#f87171'}">$${p.ev >= 0 ? '+' : ''}${p.ev}</strong></div>
+        </div>
+        <div class="prob-bar">
+          <div class="prob-fill" data-width="${trueProb}" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="pick-right">
+        <div class="edge-badge ${badgeClass}">${badgeText}</div>
+        <div class="side-label ${p.best_side}">${p.best_side}</div>
+        <div class="line-info">${p.best_side === 'OVER' ? p.over_odds > 0 ? '+'+p.over_odds : p.over_odds : p.under_odds > 0 ? '+'+p.under_odds : p.under_odds}</div>
+      </div>
+    </div>`;
+}
+
+loadPicks();
+// Auto-refresh every 30 minutes to preserve API credits
+setInterval(loadPicks, 30 * 60 * 1000);
+</script>
+</body>
+</html>
