@@ -198,9 +198,9 @@ def load_all_team_scoring():
     headers = {"Authorization": BALLDONTLIE_KEY}
     today   = datetime.now().strftime("%Y-%m-%d")
     all_games = []
-    days_used = 45
+    days_used = 20
 
-    for days_back in [45, 90]:
+    for days_back in [20, 35]:  # short window = playoff data only
         days_used = days_back
         start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         try:
