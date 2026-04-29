@@ -156,7 +156,29 @@ def get_player_props(sport_key, event_id):
 
 
 # ── BallDontLie — Team scoring model ─────────────────────────────────────
-_team_cache = {}  # cache team scoring so we don't re-fetch same team twice per refresh
+_team_cache    = {}  # team scoring results
+_bdl_team_map  = {}  # full team name -> team_id
+
+def _load_bdl_teams():
+    """Fetch all NBA teams from BallDontLie once and build name→id map."""
+    if _bdl_team_map:
+        return
+    headers = {"Authorization": BALLDONTLIE_KEY}
+    try:
+        r = requests.get(f"{BALLDONTLIE_BASE}/teams", headers=headers, timeout=10)
+        if r.status_code == 200:
+            for t in r.json().get("data", []):
+                city = t.get("city", "")
+                name = t.get("name", "")
+                tid  = t["id"]
+                _bdl_team_map[f"{city} {name}".strip()] = tid
+                _bdl_team_map[name] = tid
+                _bdl_team_map[t.get("full_name", "")] = tid
+            print(f"[bdl] loaded {len(_bdl_team_map)} team entries")
+        else:
+            print(f"[bdl] teams load failed: {r.status_code} {r.text[:100]}")
+    except Exception as e:
+        print(f"[bdl] teams load error: {e}")
 
 def get_team_scoring(team_name):
     """
@@ -166,20 +188,24 @@ def get_team_scoring(team_name):
     if team_name in _team_cache:
         return _team_cache[team_name]
 
+    _load_bdl_teams()
     headers = {"Authorization": BALLDONTLIE_KEY}
     try:
-        # Find team ID
-        r = requests.get(
-            f"{BALLDONTLIE_BASE}/teams",
-            params={"search": team_name},
-            headers=headers, timeout=10
-        )
-        if r.status_code != 200:
+        # Find team ID — try full name, then last word (e.g. "Knicks")
+        team_id = _bdl_team_map.get(team_name)
+        if not team_id:
+            last_word = team_name.split()[-1]
+            team_id   = _bdl_team_map.get(last_word)
+        if not team_id:
+            # Last resort: search API
+            r = requests.get(f"{BALLDONTLIE_BASE}/teams",
+                             params={"search": team_name.split()[-1]},
+                             headers=headers, timeout=10)
+            if r.status_code == 200 and r.json().get("data"):
+                team_id = r.json()["data"][0]["id"]
+        if not team_id:
+            print(f"[bdl] team not found: {team_name}")
             return None
-        teams = r.json().get("data", [])
-        if not teams:
-            return None
-        team_id = teams[0]["id"]
 
         # Try current season playoffs first, then regular season, then prior season
         games = []
@@ -948,7 +974,8 @@ def start_scheduler():
         scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
     scheduler.start()
     print("[scheduler] started — refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
-    # Run once immediately on startup so picks are ready right away
+    # Pre-load team map then run initial cache refresh
+    _load_bdl_teams()
     refresh_cache()
 
 # Start scheduler (skip in debug reloader child process to avoid double-start)
