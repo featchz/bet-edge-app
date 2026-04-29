@@ -1062,6 +1062,56 @@ def raw():
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
 
+@app.route("/api/debug-bdl")
+def debug_bdl():
+    """Debug: test BDL team lookup and game fetch for one team."""
+    team = request.args.get("team", "Boston Celtics")
+    _load_bdl_teams()
+    headers = {"Authorization": BALLDONTLIE_KEY}
+
+    # Step 1: team map lookup
+    team_id = _bdl_team_map.get(team) or _bdl_team_map.get(team.split()[-1])
+    map_keys_sample = list(_bdl_team_map.keys())[:10]
+
+    results = {"team": team, "team_id": team_id, "map_keys_sample": map_keys_sample}
+
+    if not team_id:
+        results["error"] = "team not found in map"
+        return jsonify(results)
+
+    # Step 2: try each season/postseason combo
+    season_results = {}
+    for season, postseason in [(2025, True), (2025, False), (2024, True), (2024, False)]:
+        key = f"{season}_{'post' if postseason else 'reg'}"
+        params = {"team_ids[]": team_id, "seasons[]": season, "per_page": 5}
+        if postseason:
+            params["postseason"] = "true"
+        try:
+            r = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
+                             headers=headers, timeout=10)
+            data = r.json() if r.status_code == 200 else {}
+            games = data.get("data", [])
+            season_results[key] = {
+                "status": r.status_code,
+                "games_returned": len(games),
+                "sample": [{"date": g.get("date"), "home": g.get("home_team", {}).get("name"),
+                             "away": g.get("visitor_team", {}).get("name"),
+                             "score": f"{g.get('home_team_score')}-{g.get('visitor_team_score')}",
+                             "status": g.get("status")} for g in games[:3]],
+            }
+        except Exception as e:
+            season_results[key] = {"error": str(e)}
+
+    results["season_results"] = season_results
+
+    # Step 3: what get_team_scoring returns
+    _team_cache.clear()
+    scoring = get_team_scoring(team)
+    results["get_team_scoring_result"] = scoring
+
+    return jsonify(results)
+
+
 @app.route("/api/injuries")
 def injuries_debug():
     """Debug endpoint — shows current injury report data from ESPN."""
@@ -1105,20 +1155,17 @@ def debug():
     return jsonify(results)
 
 
-# ── Scheduler — refreshes picks at fixed times PT ────────────────────────
+# ── Scheduler -- refreshes picks at fixed times PT ────────────────────────
 def start_scheduler():
     PT = pytz.timezone("America/Los_Angeles")
     scheduler = BackgroundScheduler(timezone=PT)
-    # Refresh at 4am, 8am, 12pm, 4pm, 6pm PT daily
     for hour in [4, 8, 12, 16, 18]:
         scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
     scheduler.start()
-    print("[scheduler] started — refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
-    # Pre-load team map then run initial cache refresh
+    print("[scheduler] started -- refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
     _load_bdl_teams()
     refresh_cache()
 
-# Start scheduler (skip in debug reloader child process to avoid double-start)
 import os
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
     start_scheduler()
