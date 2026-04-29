@@ -652,10 +652,7 @@ def api_picks():
 
     picks = sorted(picks, key=lambda x: x["edge"], reverse=True)
 
-    next_refresh = ""
-    if _cache["last_fetch"]:
-        mins_left = int(CACHE_MINUTES - (datetime.now() - _cache["last_fetch"]).total_seconds() / 60)
-        next_refresh = f"Next refresh in ~{max(0, mins_left)} min"
+    next_refresh = "Refreshes at 4am, 8am, 12pm, 4pm, 6pm PT"
 
     return jsonify({
         "date":         datetime.now().strftime("%B %d, %Y"),
