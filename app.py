@@ -41,11 +41,19 @@ def refresh_cache():
     Uses game-level odds only (h2h + totals) for all sports.
     Free tier: 500 credits/month. At 4-hour intervals = ~6 refreshes/day x 3 calls = ~18/day = ~540/month.
     """
-    picks = []
-    picks += fetch_game_picks("basketball_nba", "NBA")
-    picks += fetch_game_picks("baseball_mlb",   "MLB")
-    picks += fetch_game_picks("icehockey_nhl",  "NHL")
-    picks.sort(key=lambda x: x["edge"], reverse=True)
+    raw = []
+    raw += fetch_game_picks("basketball_nba", "NBA")
+    raw += fetch_game_picks("baseball_mlb",   "MLB")
+    raw += fetch_game_picks("icehockey_nhl",  "NHL")
+
+    # Deduplicate — keep only the best-edge side per game+market
+    seen = {}
+    for p in raw:
+        key = (p["player"], p["stat"], p.get("line", 0))
+        if key not in seen or p["edge"] > seen[key]["edge"]:
+            seen[key] = p
+    picks = sorted(seen.values(), key=lambda x: x["edge"], reverse=True)
+
     _cache["picks"]      = picks[:50]
     _cache["last_fetch"] = datetime.now()
     print(f"[cache] refreshed — {len(_cache['picks'])} picks, {datetime.now().strftime('%I:%M %p')}")
