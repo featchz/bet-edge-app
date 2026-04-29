@@ -195,16 +195,13 @@ def load_all_team_scoring():
     that trigger rate limits on BDL's free tier.
     """
     _team_cache.clear()
-    _load_bdl_teams()
-    if not _bdl_id_to_name:
-        print("[bdl] team map empty — skipping bulk load")
-        return
-
     headers = {"Authorization": BALLDONTLIE_KEY}
     today   = datetime.now().strftime("%Y-%m-%d")
     all_games = []
+    days_used = 45
 
     for days_back in [45, 90]:
+        days_used = days_back
         start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         try:
             r = requests.get(
@@ -215,9 +212,9 @@ def load_all_team_scoring():
             )
             if r.status_code == 200:
                 all_games = r.json().get("data", [])
-                completed = [g for g in all_games
-                             if int(g.get("home_team_score") or 0) > 0]
-                if len(completed) >= 30:
+                completed_count = sum(1 for g in all_games
+                                      if int(g.get("home_team_score") or 0) > 0)
+                if completed_count >= 30:
                     break
             else:
                 print(f"[bdl] bulk load status {r.status_code}: {r.text[:100]}")
@@ -229,7 +226,7 @@ def load_all_team_scoring():
         print("[bdl] bulk load returned no games")
         return
 
-    # Filter to completed games only
+    # Filter completed games
     completed = [
         g for g in all_games
         if int(g.get("home_team_score") or 0) > 0
@@ -237,19 +234,27 @@ def load_all_team_scoring():
     ]
     completed.sort(key=lambda g: g.get("date", ""), reverse=True)
 
-    # Accumulate per-team results
-    team_games = {}  # team_id -> [(pts_scored, pts_allowed, date)]
+    # Build team name + scoring from game objects directly — no /teams call needed
+    team_data = {}  # team_id -> {full_name, short_name, games: [(scored, allowed, date)]}
     for g in completed:
-        home_id    = g["home_team"]["id"]
-        away_id    = g["visitor_team"]["id"]
-        home_score = g["home_team_score"]
-        away_score = g["visitor_team_score"]
-        date       = g.get("date", "")
-        team_games.setdefault(home_id, []).append((home_score, away_score, date))
-        team_games.setdefault(away_id, []).append((away_score, home_score, date))
+        for side, opp_score, t in [
+            ("home", g["visitor_team_score"], g["home_team"]),
+            ("away", g["home_team_score"],    g["visitor_team"]),
+        ]:
+            my_score = g["home_team_score"] if side == "home" else g["visitor_team_score"]
+            tid      = t["id"]
+            city     = t.get("city", "")
+            name     = t.get("name", "")
+            fullname = f"{city} {name}".strip() if city else name
+            date     = g.get("date", "")
 
-    # Build scoring averages for each team found
-    for team_id, games_list in team_games.items():
+            if tid not in team_data:
+                team_data[tid] = {"full": fullname, "short": name, "games": []}
+            team_data[tid]["games"].append((my_score, opp_score, date))
+
+    # Compute averages, populate cache
+    for tid, info in team_data.items():
+        games_list = info["games"]
         games_list.sort(key=lambda x: x[2], reverse=True)
         recent = games_list[:15]
         if len(recent) < 3:
@@ -261,14 +266,12 @@ def load_all_team_scoring():
             "avg_allowed": round(sum(allowed) / len(allowed), 1),
             "games":       len(recent),
         }
-        fullname = _bdl_id_to_name.get(team_id, "")
-        if fullname:
-            _team_cache[fullname]              = result
-            _team_cache[fullname.split()[-1]]  = result  # e.g. "Celtics"
+        for key in [info["full"], info["short"]]:
+            if key:
+                _team_cache[key] = result
 
-    covered = len([k for k in _team_cache if ' ' in k])
-    print(f"[bdl] bulk load: {covered} teams from {len(completed)} games "
-          f"({days_back} days)")
+    covered = len([k for k in _team_cache if " " in k])
+    print(f"[bdl] bulk load: {covered} teams, {len(completed)} games ({days_used}d)")
 
 def get_team_scoring(team_name):
     """
@@ -1126,10 +1129,12 @@ def debug_bdl():
 
     results["date_results"] = date_results
 
-    # Step 3: what get_team_scoring returns
-    _team_cache.clear()
+    # Step 3: force a bulk reload then check get_team_scoring
+    load_all_team_scoring()
     scoring = get_team_scoring(team)
     results["get_team_scoring_result"] = scoring
+    results["team_cache_size"] = len(_team_cache)
+    results["team_cache_sample"] = {k: v for k, v in list(_team_cache.items())[:6] if " " in k}
 
     return jsonify(results)
 
