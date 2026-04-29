@@ -18,33 +18,33 @@ import math
 import requests
 from math import erf, sqrt
 from datetime import datetime
+import pytz
 from flask import Flask, render_template, jsonify, request
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# ── Cache — fetches API once every 30 min, serves all users from cache ───
+# ── Cache — refreshed on schedule, served instantly to all users ──────────
 _cache = {
     "picks":      [],
     "last_fetch": None,
     "credits":    None,
 }
-CACHE_MINUTES = 30
 
 def cache_is_fresh():
-    if not _cache["last_fetch"]:
-        return False
-    age = (datetime.now() - _cache["last_fetch"]).total_seconds() / 60
-    return age < CACHE_MINUTES
+    """If we have any picks at all, serve them. Scheduler keeps it fresh."""
+    return bool(_cache["picks"])
 
 def refresh_cache():
+    """
+    Credit-efficient refresh — 3 API calls per refresh instead of 16.
+    Uses game-level odds only (h2h + totals) for all sports.
+    Free tier: 500 credits/month. At 4-hour intervals = ~6 refreshes/day x 3 calls = ~18/day = ~540/month.
+    """
     picks = []
-    nba = fetch_live_picks()
-    if not nba:
-        nba = fetch_game_picks("basketball_nba", "NBA")
-    picks += [dict(p, sport="NBA") for p in nba]
-    picks += fetch_game_picks("baseball_mlb", "MLB")
-    picks += fetch_mlb_prop_picks()
-    picks += fetch_game_picks("icehockey_nhl", "NHL")
+    picks += fetch_game_picks("basketball_nba", "NBA")
+    picks += fetch_game_picks("baseball_mlb",   "MLB")
+    picks += fetch_game_picks("icehockey_nhl",  "NHL")
     picks.sort(key=lambda x: x["edge"], reverse=True)
     _cache["picks"]      = picks[:50]
     _cache["last_fetch"] = datetime.now()
@@ -720,6 +720,23 @@ def debug():
     results["key_prefix"] = ODDS_API_KEY[:8] + "..." if ODDS_API_KEY != "YOUR_KEY_HERE" else "NOT SET"
     return jsonify(results)
 
+
+# ── Scheduler — refreshes picks at fixed times PT ────────────────────────
+def start_scheduler():
+    PT = pytz.timezone("America/Los_Angeles")
+    scheduler = BackgroundScheduler(timezone=PT)
+    # Refresh at 4am, 8am, 12pm, 4pm, 6pm PT daily
+    for hour in [4, 8, 12, 16, 18]:
+        scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
+    scheduler.start()
+    print("[scheduler] started — refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
+    # Run once immediately on startup so picks are ready right away
+    refresh_cache()
+
+# Start scheduler (skip in debug reloader child process to avoid double-start)
+import os
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    start_scheduler()
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
