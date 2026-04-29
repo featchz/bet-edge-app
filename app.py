@@ -42,9 +42,13 @@ def refresh_cache():
     Free tier: 500 credits/month. At 4-hour intervals = ~6 refreshes/day x 3 calls = ~18/day = ~540/month.
     """
     raw = []
-    raw += fetch_nba_picks()                          # Smart model: team scoring + stats
-    raw += fetch_game_picks("baseball_mlb",   "MLB")  # Market comparison for now
-    raw += fetch_game_picks("icehockey_nhl",  "NHL")  # Market comparison for now
+    nba = fetch_nba_picks()  # Smart model: team scoring + stats
+    if not nba:
+        print("[cache] NBA team model returned empty — falling back to market comparison")
+        nba = fetch_game_picks("basketball_nba", "NBA")
+    raw += nba
+    raw += fetch_game_picks("baseball_mlb",   "MLB")
+    raw += fetch_game_picks("icehockey_nhl",  "NHL")
 
     # Deduplicate — keep only the best-edge side per game+market
     seen = {}
@@ -177,23 +181,19 @@ def get_team_scoring(team_name):
             return None
         team_id = teams[0]["id"]
 
-        # Get last 15 completed games
-        r2 = requests.get(
-            f"{BALLDONTLIE_BASE}/games",
-            params={"team_ids[]": team_id, "seasons[]": 2025,
-                    "per_page": 15, "postseason": "true"},
-            headers=headers, timeout=10
-        )
-        games = r2.json().get("data", []) if r2.status_code == 200 else []
-
-        # Fall back to regular season if playoffs thin
-        if len(games) < 5:
-            r3 = requests.get(
-                f"{BALLDONTLIE_BASE}/games",
-                params={"team_ids[]": team_id, "seasons[]": 2025, "per_page": 15},
-                headers=headers, timeout=10
-            )
-            games = r3.json().get("data", []) if r3.status_code == 200 else []
+        # Try current season playoffs first, then regular season, then prior season
+        games = []
+        for season, postseason in [(2025, "true"), (2025, "false"), (2024, "false")]:
+            if len(games) >= 5:
+                break
+            params = {"team_ids[]": team_id, "seasons[]": season, "per_page": 15}
+            if postseason == "true":
+                params["postseason"] = "true"
+            r2 = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
+                               headers=headers, timeout=10)
+            if r2.status_code == 200:
+                new_games = r2.json().get("data", [])
+                games = (games + new_games)[:15]
 
         pts_scored, pts_allowed = [], []
         for g in games:
