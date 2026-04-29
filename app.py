@@ -37,10 +37,10 @@ def cache_is_fresh():
 
 def refresh_cache():
     """
-    Credit-efficient refresh — 3 API calls per refresh instead of 16.
-    Uses game-level odds only (h2h + totals) for all sports.
-    Free tier: 500 credits/month. At 4-hour intervals = ~6 refreshes/day x 3 calls = ~18/day = ~540/month.
+    Credit-efficient refresh — 3 Odds API calls per refresh.
+    BDL is 1 bulk call (all teams at once) to avoid rate limits.
     """
+    load_all_team_scoring()   # 1 BDL call — builds scoring for all 30 teams
     raw = []
     nba = fetch_nba_picks()  # Smart model: team scoring + stats
     if not nba:
@@ -156,15 +156,16 @@ def get_player_props(sport_key, event_id):
 
 
 # ── BallDontLie — Team scoring model ─────────────────────────────────────
-_team_cache    = {}  # team scoring results
-_bdl_team_map  = {}  # full team name -> team_id
+_team_cache       = {}  # team_name -> {avg_scored, avg_allowed, games}
+_bdl_team_map     = {}  # full team name -> team_id
+_bdl_id_to_name   = {}  # team_id -> "City TeamName"
 
 # ── ESPN Injury cache ─────────────────────────────────────────────────────
 _injury_cache      = {}   # {team_display_name: [{player, status, comment}]}
 _injury_fetch_time = None
 
 def _load_bdl_teams():
-    """Fetch all NBA teams from BallDontLie once and build name→id map."""
+    """Fetch all NBA teams from BallDontLie once and build name↔id maps."""
     if _bdl_team_map:
         return
     headers = {"Authorization": BALLDONTLIE_KEY}
@@ -172,105 +173,113 @@ def _load_bdl_teams():
         r = requests.get(f"{BALLDONTLIE_BASE}/teams", headers=headers, timeout=10)
         if r.status_code == 200:
             for t in r.json().get("data", []):
-                city = t.get("city", "")
-                name = t.get("name", "")
-                tid  = t["id"]
-                _bdl_team_map[f"{city} {name}".strip()] = tid
-                _bdl_team_map[name] = tid
+                city     = t.get("city", "")
+                name     = t.get("name", "")
+                tid      = t["id"]
+                fullname = f"{city} {name}".strip()
+                _bdl_team_map[fullname]              = tid
+                _bdl_team_map[name]                  = tid
                 _bdl_team_map[t.get("full_name", "")] = tid
-            print(f"[bdl] loaded {len(_bdl_team_map)} team entries")
+                _bdl_id_to_name[tid]                 = fullname  # reverse map
+            print(f"[bdl] loaded {len(_bdl_id_to_name)} teams")
         else:
             print(f"[bdl] teams load failed: {r.status_code} {r.text[:100]}")
     except Exception as e:
         print(f"[bdl] teams load error: {e}")
 
+
+def load_all_team_scoring():
+    """
+    Fetch ALL NBA game results from last 45-90 days in ONE BDL API call.
+    Builds scoring averages for every team at once — avoids per-team calls
+    that trigger rate limits on BDL's free tier.
+    """
+    _team_cache.clear()
+    _load_bdl_teams()
+    if not _bdl_id_to_name:
+        print("[bdl] team map empty — skipping bulk load")
+        return
+
+    headers = {"Authorization": BALLDONTLIE_KEY}
+    today   = datetime.now().strftime("%Y-%m-%d")
+    all_games = []
+
+    for days_back in [45, 90]:
+        start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        try:
+            r = requests.get(
+                f"{BALLDONTLIE_BASE}/games",
+                params={"start_date": start, "end_date": today, "per_page": 100},
+                headers=headers,
+                timeout=15,
+            )
+            if r.status_code == 200:
+                all_games = r.json().get("data", [])
+                completed = [g for g in all_games
+                             if int(g.get("home_team_score") or 0) > 0]
+                if len(completed) >= 30:
+                    break
+            else:
+                print(f"[bdl] bulk load status {r.status_code}: {r.text[:100]}")
+        except Exception as e:
+            print(f"[bdl] bulk load error: {e}")
+            return
+
+    if not all_games:
+        print("[bdl] bulk load returned no games")
+        return
+
+    # Filter to completed games only
+    completed = [
+        g for g in all_games
+        if int(g.get("home_team_score") or 0) > 0
+        and int(g.get("visitor_team_score") or 0) > 0
+    ]
+    completed.sort(key=lambda g: g.get("date", ""), reverse=True)
+
+    # Accumulate per-team results
+    team_games = {}  # team_id -> [(pts_scored, pts_allowed, date)]
+    for g in completed:
+        home_id    = g["home_team"]["id"]
+        away_id    = g["visitor_team"]["id"]
+        home_score = g["home_team_score"]
+        away_score = g["visitor_team_score"]
+        date       = g.get("date", "")
+        team_games.setdefault(home_id, []).append((home_score, away_score, date))
+        team_games.setdefault(away_id, []).append((away_score, home_score, date))
+
+    # Build scoring averages for each team found
+    for team_id, games_list in team_games.items():
+        games_list.sort(key=lambda x: x[2], reverse=True)
+        recent = games_list[:15]
+        if len(recent) < 3:
+            continue
+        scored  = [g[0] for g in recent]
+        allowed = [g[1] for g in recent]
+        result  = {
+            "avg_scored":  round(sum(scored)  / len(scored),  1),
+            "avg_allowed": round(sum(allowed) / len(allowed), 1),
+            "games":       len(recent),
+        }
+        fullname = _bdl_id_to_name.get(team_id, "")
+        if fullname:
+            _team_cache[fullname]              = result
+            _team_cache[fullname.split()[-1]]  = result  # e.g. "Celtics"
+
+    covered = len([k for k in _team_cache if ' ' in k])
+    print(f"[bdl] bulk load: {covered} teams from {len(completed)} games "
+          f"({days_back} days)")
+
 def get_team_scoring(team_name):
     """
-    Fetch a team's most recent completed game scores from BallDontLie.
-    Uses date-based queries (last 45/90/180 days) instead of season numbers
-    so we always get current-form data regardless of season boundaries.
+    Look up pre-built team scoring from _team_cache (populated by load_all_team_scoring).
+    Falls back to short name (last word) if full name not found.
+    No API calls — all data fetched in one bulk call at refresh time.
     """
-    if team_name in _team_cache:
-        return _team_cache[team_name]
-
-    _load_bdl_teams()
-    headers = {"Authorization": BALLDONTLIE_KEY}
-    try:
-        # Find team ID — try full name, last word, then search API
-        team_id = _bdl_team_map.get(team_name)
-        if not team_id:
-            last_word = team_name.split()[-1]
-            team_id   = _bdl_team_map.get(last_word)
-        if not team_id:
-            r = requests.get(f"{BALLDONTLIE_BASE}/teams",
-                             params={"search": team_name.split()[-1]},
-                             headers=headers, timeout=10)
-            if r.status_code == 200 and r.json().get("data"):
-                team_id = r.json()["data"][0]["id"]
-        if not team_id:
-            print(f"[bdl] team not found: {team_name}")
-            return None
-
-        # Query by date range — start narrow (recent form), widen if not enough games
-        all_games = []
-        today = datetime.now().strftime("%Y-%m-%d")
-        for days_back in [45, 90, 180]:
-            start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-            params = {
-                "team_ids[]": team_id,
-                "start_date": start_date,
-                "end_date":   today,
-                "per_page":   30,
-            }
-            r2 = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
-                               headers=headers, timeout=10)
-            if r2.status_code == 200:
-                all_games = r2.json().get("data", [])
-            # Need at least 5 completed games — otherwise widen window
-            completed_count = sum(
-                1 for g in all_games
-                if int(g.get("home_team_score") or 0) > 0
-                and int(g.get("visitor_team_score") or 0) > 0
-            )
-            if completed_count >= 5:
-                break
-
-        # Filter: game is complete if both teams have non-zero scores
-        completed = [
-            g for g in all_games
-            if int(g.get("home_team_score") or 0) > 0
-            and int(g.get("visitor_team_score") or 0) > 0
-        ]
-
-        # Sort most-recent first, take 15
-        completed.sort(key=lambda g: g.get("date", ""), reverse=True)
-        completed = completed[:15]
-
-        pts_scored, pts_allowed = [], []
-        for g in completed:
-            if g["home_team"]["id"] == team_id:
-                pts_scored.append(g["home_team_score"])
-                pts_allowed.append(g["visitor_team_score"])
-            else:
-                pts_scored.append(g["visitor_team_score"])
-                pts_allowed.append(g["home_team_score"])
-
-        if len(pts_scored) < 3:
-            print(f"[bdl] not enough games for {team_name}: {len(pts_scored)} found")
-            return None
-
-        result = {
-            "avg_scored":  round(sum(pts_scored)  / len(pts_scored),  1),
-            "avg_allowed": round(sum(pts_allowed) / len(pts_allowed), 1),
-            "games":       len(pts_scored),
-        }
-        _team_cache[team_name] = result
-        print(f"[bdl] {team_name}: {result['games']} games, "
-              f"scored {result['avg_scored']}, allowed {result['avg_allowed']}")
-        return result
-    except Exception as e:
-        print(f"[bdl] get_team_scoring error for {team_name}: {e}")
-        return None
+    result = _team_cache.get(team_name) or _team_cache.get(team_name.split()[-1])
+    if not result:
+        print(f"[bdl] no scoring data for: {team_name}")
+    return result
 
 
 def project_nba_total(home_team, away_team):
@@ -657,8 +666,6 @@ def fetch_nba_picks():
     to get true win probability. Much higher confidence than market comparison.
     """
     picks = []
-    _team_cache.clear()  # fresh team data each refresh
-
     try:
         r = requests.get(
             f"{ODDS_API_BASE}/sports/basketball_nba/odds",
@@ -1166,4 +1173,23 @@ def debug():
         except Exception as e:
             results[label] = {"status": "exception", "error": str(e)}
     results["key_loaded"] = ODDS_API_KEY != "YOUR_KEY_HERE"
-    results["key_prefix"] = ODDS_API_KEY[:8] + "..." if ODDS_API_KEY != "YOUR_KEY_HERE" else "NOT SET"
+    results["key_prefix"] = (ODDS_API_KEY[:8] + "...") if ODDS_API_KEY != "YOUR_KEY_HERE" else "NOT SET"
+    return jsonify(results)
+
+
+# ── Scheduler -- refreshes picks at fixed times PT ────────────────────────
+def start_scheduler():
+    PT = pytz.timezone("America/Los_Angeles")
+    scheduler = BackgroundScheduler(timezone=PT)
+    for hour in [4, 8, 12, 16, 18]:
+        scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
+    scheduler.start()
+    print("[scheduler] started -- refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
+    refresh_cache()  # runs load_all_team_scoring() internally
+
+import os
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    start_scheduler()
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
