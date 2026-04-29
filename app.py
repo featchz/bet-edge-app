@@ -17,7 +17,7 @@ except ImportError:
 import math
 import requests
 from math import erf, sqrt
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 from flask import Flask, render_template, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -186,9 +186,9 @@ def _load_bdl_teams():
 
 def get_team_scoring(team_name):
     """
-    Fetch a team's last 15 completed game scores from BallDontLie.
-    Checks both postseason + regular season across current and prior seasons.
-    Uses score-based completion check (not status string) so playoff games count.
+    Fetch a team's most recent completed game scores from BallDontLie.
+    Uses date-based queries (last 45/90/180 days) instead of season numbers
+    so we always get current-form data regardless of season boundaries.
     """
     if team_name in _team_cache:
         return _team_cache[team_name]
@@ -211,29 +211,38 @@ def get_team_scoring(team_name):
             print(f"[bdl] team not found: {team_name}")
             return None
 
-        # Collect games across postseason + regular, current + prior season
-        # This ensures playoff teams get data even when postseason data is thin
+        # Query by date range — start narrow (recent form), widen if not enough games
         all_games = []
-        for season, postseason in [(2025, True), (2025, False), (2024, True), (2024, False)]:
-            if len(all_games) >= 30:
-                break
-            params = {"team_ids[]": team_id, "seasons[]": season, "per_page": 15}
-            if postseason:
-                params["postseason"] = "true"
+        today = datetime.now().strftime("%Y-%m-%d")
+        for days_back in [45, 90, 180]:
+            start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            params = {
+                "team_ids[]": team_id,
+                "start_date": start_date,
+                "end_date":   today,
+                "per_page":   30,
+            }
             r2 = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
                                headers=headers, timeout=10)
             if r2.status_code == 200:
-                all_games.extend(r2.json().get("data", []))
+                all_games = r2.json().get("data", [])
+            # Need at least 5 completed games — otherwise widen window
+            completed_count = sum(
+                1 for g in all_games
+                if int(g.get("home_team_score") or 0) > 0
+                and int(g.get("visitor_team_score") or 0) > 0
+            )
+            if completed_count >= 5:
+                break
 
-        # Filter: game is complete if both teams scored (don't rely on status string)
+        # Filter: game is complete if both teams have non-zero scores
         completed = [
             g for g in all_games
-            if g.get("home_team_score") and g.get("visitor_team_score")
-            and int(g.get("home_team_score", 0)) > 0
-            and int(g.get("visitor_team_score", 0)) > 0
+            if int(g.get("home_team_score") or 0) > 0
+            and int(g.get("visitor_team_score") or 0) > 0
         ]
 
-        # Sort most-recent first, take last 15
+        # Sort most-recent first, take 15
         completed.sort(key=lambda g: g.get("date", ""), reverse=True)
         completed = completed[:15]
 
@@ -256,6 +265,8 @@ def get_team_scoring(team_name):
             "games":       len(pts_scored),
         }
         _team_cache[team_name] = result
+        print(f"[bdl] {team_name}: {result['games']} games, "
+              f"scored {result['avg_scored']}, allowed {result['avg_allowed']}")
         return result
     except Exception as e:
         print(f"[bdl] get_team_scoring error for {team_name}: {e}")
@@ -728,11 +739,11 @@ def fetch_nba_picks():
         best_odds = best_over if best_side == "OVER" else best_under
         true_p    = p_over if best_side == "OVER" else p_under
 
-        # Only show picks with meaningful model edge (>3%)
-        if best_edge < 0.03:
+        # Only show picks with meaningful model edge (>1.5%)
+        if best_edge < 0.015:
             continue
 
-        strength = "strong" if best_edge >= 0.08 else "value"
+        strength = "strong" if best_edge >= 0.08 else ("value" if best_edge >= 0.04 else "lean")
 
         picks.append({
             "player":       matchup,
@@ -1079,30 +1090,34 @@ def debug_bdl():
         results["error"] = "team not found in map"
         return jsonify(results)
 
-    # Step 2: try each season/postseason combo
-    season_results = {}
-    for season, postseason in [(2025, True), (2025, False), (2024, True), (2024, False)]:
-        key = f"{season}_{'post' if postseason else 'reg'}"
-        params = {"team_ids[]": team_id, "seasons[]": season, "per_page": 5}
-        if postseason:
-            params["postseason"] = "true"
+    # Step 2: test date-range queries (45 / 90 days back)
+    today = datetime.now().strftime("%Y-%m-%d")
+    date_results = {}
+    for days_back in [45, 90]:
+        start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        key = f"last_{days_back}_days"
         try:
-            r = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
+            r = requests.get(f"{BALLDONTLIE_BASE}/games",
+                             params={"team_ids[]": team_id, "start_date": start,
+                                     "end_date": today, "per_page": 30},
                              headers=headers, timeout=10)
             data = r.json() if r.status_code == 200 else {}
             games = data.get("data", [])
-            season_results[key] = {
+            completed = [g for g in games if int(g.get("home_team_score") or 0) > 0]
+            date_results[key] = {
                 "status": r.status_code,
                 "games_returned": len(games),
-                "sample": [{"date": g.get("date"), "home": g.get("home_team", {}).get("name"),
+                "completed": len(completed),
+                "sample": [{"date": g.get("date"),
+                             "home": g.get("home_team", {}).get("name"),
                              "away": g.get("visitor_team", {}).get("name"),
                              "score": f"{g.get('home_team_score')}-{g.get('visitor_team_score')}",
-                             "status": g.get("status")} for g in games[:3]],
+                             "status": g.get("status")} for g in sorted(games, key=lambda x: x.get("date",""), reverse=True)[:5]],
             }
         except Exception as e:
-            season_results[key] = {"error": str(e)}
+            date_results[key] = {"error": str(e)}
 
-    results["season_results"] = season_results
+    results["date_results"] = date_results
 
     # Step 3: what get_team_scoring returns
     _team_cache.clear()
@@ -1152,23 +1167,3 @@ def debug():
             results[label] = {"status": "exception", "error": str(e)}
     results["key_loaded"] = ODDS_API_KEY != "YOUR_KEY_HERE"
     results["key_prefix"] = ODDS_API_KEY[:8] + "..." if ODDS_API_KEY != "YOUR_KEY_HERE" else "NOT SET"
-    return jsonify(results)
-
-
-# ── Scheduler -- refreshes picks at fixed times PT ────────────────────────
-def start_scheduler():
-    PT = pytz.timezone("America/Los_Angeles")
-    scheduler = BackgroundScheduler(timezone=PT)
-    for hour in [4, 8, 12, 16, 18]:
-        scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
-    scheduler.start()
-    print("[scheduler] started -- refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
-    _load_bdl_teams()
-    refresh_cache()
-
-import os
-if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-    start_scheduler()
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
