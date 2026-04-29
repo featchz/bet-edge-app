@@ -445,21 +445,23 @@ def fetch_game_picks(sport_key, sport_label):
         if totals.get("over_prices") and totals.get("under_prices"):
             best_over  = max(totals["over_prices"])
             best_under = max(totals["under_prices"])
-            avg_over   = sum(totals["over_prices"])  / len(totals["over_prices"])
-            avg_under  = sum(totals["under_prices"]) / len(totals["under_prices"])
-            cons_imp_over  = american_to_implied(avg_over)
-            cons_imp_under = american_to_implied(avg_under)
+            # Average IMPLIED probabilities (not raw odds) for accurate consensus
+            raw_cons_over  = sum(american_to_implied(p) for p in totals["over_prices"])  / len(totals["over_prices"])
+            raw_cons_under = sum(american_to_implied(p) for p in totals["under_prices"]) / len(totals["under_prices"])
+            # De-vig: normalize so true probabilities sum to 100%
+            total_vig      = raw_cons_over + raw_cons_under
+            true_over      = raw_cons_over  / total_vig
+            true_under     = raw_cons_under / total_vig
             best_imp_over  = american_to_implied(best_over)
             best_imp_under = american_to_implied(best_under)
-            edge_over  = round(best_imp_over  - cons_imp_over,  4)
-            edge_under = round(best_imp_under - cons_imp_under, 4)
+            # Edge = best book implied minus de-vigged true probability
+            edge_over  = round(best_imp_over  - true_over,  4)
+            edge_under = round(best_imp_under - true_under, 4)
 
             for side, edge_val, odds in [("OVER", edge_over, best_over), ("UNDER", edge_under, best_under)]:
                 if edge_val < GAME_EDGE_THRESHOLD:
                     continue
-                # consensus = our best estimate of true probability
-                true_p = cons_imp_over  if side == "OVER" else cons_imp_under
-                best_p = best_imp_over  if side == "OVER" else best_imp_under
+                true_p = true_over if side == "OVER" else true_under
                 picks.append({
                     "player":     matchup,
                     "stat":       "Game Total",
@@ -472,8 +474,8 @@ def fetch_game_picks(sport_key, sport_label):
                     "strength":   "strong" if edge_val >= STRONG_THRESHOLD else "value",
                     "over_odds":  best_over,
                     "under_odds": best_under,
-                    "p_over":     round(cons_imp_over  * 100, 1),
-                    "p_under":    round(cons_imp_under * 100, 1),
+                    "p_over":     round(true_over  * 100, 1),
+                    "p_under":    round(true_under * 100, 1),
                     "imp_over":   round(best_imp_over  * 100, 1),
                     "imp_under":  round(best_imp_under * 100, 1),
                     "matchup":    matchup,
@@ -494,13 +496,12 @@ def fetch_game_picks(sport_key, sport_label):
             if len(prices) < 2:
                 continue
             best_price = max(prices)
-            avg_price  = sum(prices) / len(prices)
+            # Average implied probabilities (not raw odds)
+            cons_imp   = sum(american_to_implied(p) for p in prices) / len(prices)
             best_imp   = american_to_implied(best_price)
-            cons_imp   = american_to_implied(avg_price)
             edge_val   = round(best_imp - cons_imp, 4)
             if edge_val < GAME_EDGE_THRESHOLD:
                 continue
-            opp = home if team == away else away
             picks.append({
                 "player":    team,
                 "stat":      "Moneyline",
@@ -509,14 +510,14 @@ def fetch_game_picks(sport_key, sport_label):
                 "projection": 0,
                 "best_side": "WIN",
                 "edge":      round(edge_val * 100, 1),
-                "ev":        ev_calc(best_imp, best_price),
+                "ev":        ev_calc(cons_imp, best_price),
                 "strength":  "strong" if edge_val >= STRONG_THRESHOLD else "value",
                 "over_odds": best_price,
                 "under_odds": best_price,
-                "p_over":    round(best_imp * 100, 1),
-                "p_under":   round((1 - best_imp) * 100, 1),
-                "imp_over":  round(cons_imp * 100, 1),
-                "imp_under": round((1 - cons_imp) * 100, 1),
+                "p_over":    round(cons_imp * 100, 1),
+                "p_under":   round((1 - cons_imp) * 100, 1),
+                "imp_over":  round(best_imp * 100, 1),
+                "imp_under": round((1 - best_imp) * 100, 1),
                 "matchup":   matchup,
             })
 
@@ -587,21 +588,23 @@ def fetch_mlb_prop_picks():
                 continue
             best_over  = max(prop["over_prices"])
             best_under = max(prop["under_prices"])
-            avg_over   = sum(prop["over_prices"])  / len(prop["over_prices"])
-            avg_under  = sum(prop["under_prices"]) / len(prop["under_prices"])
+            # Average implied probabilities (not raw odds)
+            raw_cons_over  = sum(american_to_implied(p) for p in prop["over_prices"])  / len(prop["over_prices"])
+            raw_cons_under = sum(american_to_implied(p) for p in prop["under_prices"]) / len(prop["under_prices"])
+            # De-vig: normalize to true probabilities
+            total_vig      = raw_cons_over + raw_cons_under
+            true_over      = raw_cons_over  / total_vig
+            true_under     = raw_cons_under / total_vig
             best_imp_over  = american_to_implied(best_over)
             best_imp_under = american_to_implied(best_under)
-            cons_imp_over  = american_to_implied(avg_over)
-            cons_imp_under = american_to_implied(avg_under)
-            edge_over  = round(best_imp_over  - cons_imp_over,  4)
-            edge_under = round(best_imp_under - cons_imp_under, 4)
+            edge_over  = round(best_imp_over  - true_over,  4)
+            edge_under = round(best_imp_under - true_under, 4)
             best_side  = "OVER" if edge_over > edge_under else "UNDER"
             best_edge  = max(edge_over, edge_under)
             if best_edge < GAME_EDGE_THRESHOLD:
                 continue
-            best_odds  = best_over if best_side == "OVER" else best_under
-            true_p     = best_imp_over if best_side == "OVER" else best_imp_under
-            imp_p      = cons_imp_over  if best_side == "OVER" else cons_imp_under
+            best_odds = best_over if best_side == "OVER" else best_under
+            true_p    = true_over if best_side == "OVER" else true_under
             picks.append({
                 "player":     player,
                 "stat":       prop["stat"],
@@ -614,10 +617,10 @@ def fetch_mlb_prop_picks():
                 "strength":   "strong" if best_edge >= STRONG_THRESHOLD else "value",
                 "over_odds":  best_over,
                 "under_odds": best_under,
-                "p_over":     round((best_imp_over  if best_side == "OVER"  else best_imp_under) * 100, 1),
-                "p_under":    round((best_imp_under if best_side == "UNDER" else best_imp_over)  * 100, 1),
-                "imp_over":   round((cons_imp_over  if best_side == "OVER"  else cons_imp_under) * 100, 1),
-                "imp_under":  round((cons_imp_under if best_side == "UNDER" else cons_imp_over)  * 100, 1),
+                "p_over":     round(true_over  * 100, 1),
+                "p_under":    round(true_under * 100, 1),
+                "imp_over":   round(best_imp_over  * 100, 1),
+                "imp_under":  round(best_imp_under * 100, 1),
                 "matchup":    prop["matchup"],
             })
     return picks
