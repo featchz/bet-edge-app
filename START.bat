@@ -7,7 +7,7 @@ echo  ========================================
 echo.
 
 :: API Keys
-SET ODDS_API_KEY=2177b2ec282ca158c9bc5d61b2977f3d
+SET ODDS_API_KEY=c97ec0ac3509ca640d1f56227cfb09cd
 SET BALLDONTLIE_KEY=dfef48ff-15a7-45d4-86de-27461fa3e31f
 
 :: Find Python
