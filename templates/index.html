@@ -167,10 +167,11 @@ function renderCard(p) {
       <div class="pick-left">
         <div class="player-name">${p.player}</div>
         <div class="pick-meta">${p.sport ? '<span style="color:#3b82f6;font-weight:600">' + p.sport + '</span> · ' : ''}${p.stat}${p.line ? ' · Line: ' + p.line : ''}${p.matchup && p.matchup !== p.player ? ' · ' + p.matchup : ''}</div>
+        ${p.reason ? `<div style="font-size:12px;color:#4ade80;margin-bottom:8px;line-height:1.5">📊 ${p.reason}</div>` : ''}
         <div class="pick-detail">
           <div><span>Projection </span><strong>${p.projection}</strong></div>
-          <div><span>Consensus </span><strong>${trueProb}%</strong></div>
-          <div><span>Best odds implied </span><strong>${impProb}%</strong></div>
+          <div><span>Win Prob </span><strong>${trueProb}%</strong></div>
+          <div><span>Market implied </span><strong>${impProb}%</strong></div>
           <div><span>EV per $100 </span><strong style="color:${p.ev >= 0 ? '#4ade80' : '#f87171'}">$${p.ev >= 0 ? '+' : ''}${p.ev}</strong></div>
         </div>
         <div class="prob-bar">
