@@ -635,35 +635,39 @@ def index():
 
 @app.route("/api/picks")
 def api_picks():
-    no_key = (ODDS_API_KEY == "YOUR_KEY_HERE")
-    sport  = request.args.get("sport", "NBA").upper()
+    try:
+        no_key = (ODDS_API_KEY == "YOUR_KEY_HERE")
+        sport  = request.args.get("sport", "NBA").upper()
 
-    if no_key:
-        picks = [dict(p, sport="NBA") for p in demo_picks()]
-    else:
-        # Use cache — only hits API every 30 minutes
-        if not cache_is_fresh():
-            refresh_cache()
-        all_picks = _cache["picks"]
-        if sport == "ALL":
-            picks = all_picks
+        if no_key:
+            picks = [dict(p, sport="NBA") for p in demo_picks()]
         else:
-            picks = [p for p in all_picks if p.get("sport") == sport]
+            if not cache_is_fresh():
+                refresh_cache()
+            all_picks = _cache["picks"]
+            if sport == "ALL":
+                picks = all_picks
+            else:
+                picks = [p for p in all_picks if p.get("sport") == sport]
 
-    picks = sorted(picks, key=lambda x: x["edge"], reverse=True)
+        picks = sorted(picks, key=lambda x: x["edge"], reverse=True)
+        updated = _cache["last_fetch"].strftime("%I:%M %p PT") if _cache["last_fetch"] else "—"
 
-    next_refresh = "Refreshes at 4am, 8am, 12pm, 4pm, 6pm PT"
-
-    return jsonify({
-        "date":         datetime.now().strftime("%B %d, %Y"),
-        "sport":        sport,
-        "picks":        picks,
-        "demo_mode":    no_key,
-        "updated":      _cache["last_fetch"].strftime("%I:%M %p PT") if _cache["last_fetch"] else "—",
-        "next_refresh": next_refresh,
-        "weights":      WEIGHTS,
-        "live":         not no_key,
-    })
+        return jsonify({
+            "date":         datetime.now().strftime("%B %d, %Y"),
+            "sport":        sport,
+            "picks":        picks,
+            "demo_mode":    no_key,
+            "updated":      updated,
+            "next_refresh": "Refreshes at 4am, 8am, 12pm, 4pm, 6pm PT",
+            "weights":      WEIGHTS,
+            "live":         not no_key,
+        })
+    except Exception as e:
+        import traceback
+        print(f"[api_picks ERROR] {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e), "picks": [], "date": "", "demo_mode": False,
+                        "updated": "", "next_refresh": "", "weights": {}, "live": False}), 500
 
 @app.route("/api/raw")
 def raw():
