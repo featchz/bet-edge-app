@@ -159,6 +159,10 @@ def get_player_props(sport_key, event_id):
 _team_cache    = {}  # team scoring results
 _bdl_team_map  = {}  # full team name -> team_id
 
+# ── ESPN Injury cache ─────────────────────────────────────────────────────
+_injury_cache      = {}   # {team_display_name: [{player, status, comment}]}
+_injury_fetch_time = None
+
 def _load_bdl_teams():
     """Fetch all NBA teams from BallDontLie once and build name→id map."""
     if _bdl_team_map:
@@ -182,8 +186,9 @@ def _load_bdl_teams():
 
 def get_team_scoring(team_name):
     """
-    Fetch a team's last 15 game scores from BallDontLie.
-    Returns avg points scored, avg points allowed, and recent game totals.
+    Fetch a team's last 15 completed game scores from BallDontLie.
+    Checks both postseason + regular season across current and prior seasons.
+    Uses score-based completion check (not status string) so playoff games count.
     """
     if team_name in _team_cache:
         return _team_cache[team_name]
@@ -191,13 +196,12 @@ def get_team_scoring(team_name):
     _load_bdl_teams()
     headers = {"Authorization": BALLDONTLIE_KEY}
     try:
-        # Find team ID — try full name, then last word (e.g. "Knicks")
+        # Find team ID — try full name, last word, then search API
         team_id = _bdl_team_map.get(team_name)
         if not team_id:
             last_word = team_name.split()[-1]
             team_id   = _bdl_team_map.get(last_word)
         if not team_id:
-            # Last resort: search API
             r = requests.get(f"{BALLDONTLIE_BASE}/teams",
                              params={"search": team_name.split()[-1]},
                              headers=headers, timeout=10)
@@ -207,24 +211,34 @@ def get_team_scoring(team_name):
             print(f"[bdl] team not found: {team_name}")
             return None
 
-        # Try current season playoffs first, then regular season, then prior season
-        games = []
-        for season, postseason in [(2025, "true"), (2025, "false"), (2024, "false")]:
-            if len(games) >= 5:
+        # Collect games across postseason + regular, current + prior season
+        # This ensures playoff teams get data even when postseason data is thin
+        all_games = []
+        for season, postseason in [(2025, True), (2025, False), (2024, True), (2024, False)]:
+            if len(all_games) >= 30:
                 break
             params = {"team_ids[]": team_id, "seasons[]": season, "per_page": 15}
-            if postseason == "true":
+            if postseason:
                 params["postseason"] = "true"
             r2 = requests.get(f"{BALLDONTLIE_BASE}/games", params=params,
                                headers=headers, timeout=10)
             if r2.status_code == 200:
-                new_games = r2.json().get("data", [])
-                games = (games + new_games)[:15]
+                all_games.extend(r2.json().get("data", []))
+
+        # Filter: game is complete if both teams scored (don't rely on status string)
+        completed = [
+            g for g in all_games
+            if g.get("home_team_score") and g.get("visitor_team_score")
+            and int(g.get("home_team_score", 0)) > 0
+            and int(g.get("visitor_team_score", 0)) > 0
+        ]
+
+        # Sort most-recent first, take last 15
+        completed.sort(key=lambda g: g.get("date", ""), reverse=True)
+        completed = completed[:15]
 
         pts_scored, pts_allowed = [], []
-        for g in games:
-            if g.get("status") != "Final":
-                continue
+        for g in completed:
             if g["home_team"]["id"] == team_id:
                 pts_scored.append(g["home_team_score"])
                 pts_allowed.append(g["visitor_team_score"])
@@ -233,6 +247,7 @@ def get_team_scoring(team_name):
                 pts_allowed.append(g["home_team_score"])
 
         if len(pts_scored) < 3:
+            print(f"[bdl] not enough games for {team_name}: {len(pts_scored)} found")
             return None
 
         result = {
@@ -242,7 +257,8 @@ def get_team_scoring(team_name):
         }
         _team_cache[team_name] = result
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[bdl] get_team_scoring error for {team_name}: {e}")
         return None
 
 
@@ -269,6 +285,103 @@ def project_nba_total(home_team, away_team):
         f"{away['avg_allowed']}/g allowed"
     )
     return {"projection": total_proj, "reason": reason}
+
+
+# ── ESPN Injury Reports ───────────────────────────────────────────────────
+def fetch_nba_injuries():
+    """
+    Fetch current NBA injury report from ESPN's hidden API.
+    Returns dict: {team_display_name: [{player, status, comment}]}
+    Cached for 1 hour — injuries don't change by the minute.
+    """
+    global _injury_cache, _injury_fetch_time
+    # Serve from cache if fresh (under 60 min)
+    if _injury_cache and _injury_fetch_time:
+        elapsed = (datetime.now() - _injury_fetch_time).total_seconds()
+        if elapsed < 3600:
+            return _injury_cache
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
+            headers=headers,
+            timeout=10
+        )
+        if r.status_code != 200:
+            print(f"[injuries] ESPN returned {r.status_code}")
+            return _injury_cache  # serve stale if available
+
+        raw = r.json()
+        # ESPN may return a list or {"injuries": [...]}
+        entries = raw if isinstance(raw, list) else raw.get("injuries", raw.get("data", []))
+
+        injuries = {}
+        for entry in entries:
+            team_info = entry.get("team", {})
+            team_display = team_info.get("displayName", "")
+            team_short   = team_info.get("name", "")  # e.g. "Celtics"
+            team_abbrev  = team_info.get("abbreviation", "")
+
+            team_injuries = []
+            for inj in entry.get("injuries", []):
+                athlete = inj.get("athlete", {})
+                player  = athlete.get("displayName", "")
+                status  = inj.get("status", "")
+                comment = inj.get("shortComment") or inj.get("longComment", "")
+                if player and status:
+                    team_injuries.append({
+                        "player":  player,
+                        "status":  status,   # "Out", "Questionable", "Doubtful", "Probable"
+                        "comment": comment,
+                    })
+
+            if team_injuries:
+                # Index by every form of the team name for easy lookup
+                for key in [team_display, team_short, team_abbrev]:
+                    if key:
+                        injuries[key] = team_injuries
+
+        _injury_cache      = injuries
+        _injury_fetch_time = datetime.now()
+        total = sum(len(v) for v in injuries.values()) // max(len(injuries), 1)
+        print(f"[injuries] loaded {len(injuries)//3 if injuries else 0} teams, "
+              f"e.g. {list(injuries.keys())[:3]}")
+        return injuries
+
+    except Exception as e:
+        print(f"[injuries] fetch error: {e}")
+        return _injury_cache  # serve stale if available
+
+
+def get_team_injury_note(team_name, injuries):
+    """
+    Return a short injury warning string for a team, or '' if none.
+    Only flags Out / Doubtful / Questionable players.
+    """
+    significant = {"Out", "Doubtful", "Questionable"}
+    # Try full name, last word (e.g. "Celtics"), and first word (e.g. "Boston")
+    candidates = [
+        team_name,
+        team_name.split()[-1],
+        " ".join(team_name.split()[:2]),
+    ]
+    team_injured = []
+    seen = set()
+    for key in candidates:
+        for p in injuries.get(key, []):
+            if p["player"] not in seen and p["status"] in significant:
+                team_injured.append(p)
+                seen.add(p["player"])
+
+    if not team_injured:
+        return ""
+    parts = [f"{p['player']} ({p['status']})" for p in team_injured[:3]]
+    return "⚠️ " + ", ".join(parts)
 
 
 # ── BallDontLie stats ────────────────────────────────────────────────────
@@ -550,6 +663,9 @@ def fetch_nba_picks():
 
     NBA_TOTAL_STD = 12.0  # NBA game total standard deviation (~12 pts historically)
 
+    # Pre-fetch injury report once for all games this refresh
+    injuries = fetch_nba_injuries()
+
     for game in games:
         home  = game.get("home_team", "")
         away  = game.get("away_team", "")
@@ -587,6 +703,11 @@ def fetch_nba_picks():
         projection = proj_data["projection"]
         reason     = proj_data["reason"]
 
+        # Injury warnings for both teams
+        home_inj = get_team_injury_note(home, injuries)
+        away_inj = get_team_injury_note(away, injuries)
+        injury_note = " · ".join(filter(None, [away_inj, home_inj]))
+
         # True win probability from normal distribution
         p_over  = normal_over(projection, NBA_TOTAL_STD, line)
         p_under = 1 - p_over
@@ -614,23 +735,24 @@ def fetch_nba_picks():
         strength = "strong" if best_edge >= 0.08 else "value"
 
         picks.append({
-            "player":      matchup,
-            "stat":        "Game Total",
-            "sport":       "NBA",
-            "line":        line,
-            "projection":  projection,
-            "best_side":   best_side,
-            "edge":        round(best_edge * 100, 1),
-            "ev":          ev_calc(true_p, best_odds),
-            "strength":    strength,
-            "over_odds":   best_over,
-            "under_odds":  best_under,
-            "p_over":      round(p_over  * 100, 1),
-            "p_under":     round(p_under * 100, 1),
-            "imp_over":    round(mkt_over  * 100, 1),
-            "imp_under":   round(mkt_under * 100, 1),
-            "matchup":     matchup,
-            "reason":      reason,
+            "player":       matchup,
+            "stat":         "Game Total",
+            "sport":        "NBA",
+            "line":         line,
+            "projection":   projection,
+            "best_side":    best_side,
+            "edge":         round(best_edge * 100, 1),
+            "ev":           ev_calc(true_p, best_odds),
+            "strength":     strength,
+            "over_odds":    best_over,
+            "under_odds":   best_under,
+            "p_over":       round(p_over  * 100, 1),
+            "p_under":      round(p_under * 100, 1),
+            "imp_over":     round(mkt_over  * 100, 1),
+            "imp_under":    round(mkt_under * 100, 1),
+            "matchup":      matchup,
+            "reason":       reason,
+            "injury_note":  injury_note,
         })
 
     picks.sort(key=lambda x: x["edge"], reverse=True)
@@ -939,6 +1061,24 @@ def raw():
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+@app.route("/api/injuries")
+def injuries_debug():
+    """Debug endpoint — shows current injury report data from ESPN."""
+    data = fetch_nba_injuries()
+    # Deduplicate (each team indexed 3x ways — show unique teams)
+    seen, unique = set(), {}
+    for key, players in data.items():
+        # Use first player name as dedup key per team
+        sig = players[0]["player"] if players else key
+        if sig not in seen:
+            seen.add(sig)
+            unique[key] = players
+    return jsonify({
+        "teams_with_injuries": len(unique),
+        "fetched_at": _injury_fetch_time.isoformat() if _injury_fetch_time else None,
+        "injuries": unique,
+    })
 
 @app.route("/api/debug")
 def debug():
