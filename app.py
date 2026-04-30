@@ -785,6 +785,7 @@ def fetch_nba_picks():
             "matchup":      matchup,
             "reason":       reason,
             "injury_note":  injury_note,
+            "news_note":    get_team_news_note(home, "NBA") or get_team_news_note(away, "NBA"),
         })
 
     picks.sort(key=lambda x: x["edge"], reverse=True)
@@ -1112,6 +1113,139 @@ def get_mlb_injury_note(team_name, injuries):
     return " · ".join(notes) if notes else ""
 
 
+
+# ── ESPN News Feed — live insider info for all sports ─────────────────────
+ESPN_NEWS_URLS = {
+    "NBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news",
+    "MLB": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/news",
+    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/news",
+}
+
+# Keywords that signal betting-relevant news
+BETTING_KEYWORDS = {
+    "out", "scratch", "scratched", "injury", "injured", "il",
+    "day-to-day", "questionable", "doubtful", "suspended", "rest",
+    "lineup", "starter", "dnp", "late scratch", "probable",
+    "activated", "returns", "back from", "cleared", "shutdown",
+    "won't play", "will not play", "limited", "missed", "sits",
+    "healthy scratch", "game-time decision",
+}
+
+_news_cache      = {}
+_news_fetch_time = {}
+
+_ESPN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
+def fetch_espn_news(sport="NBA"):
+    """
+    Pull ESPN news for a sport. Cached 30 min.
+    Returns list of {headline, description, teams, age_hours, relevant}.
+    """
+    global _news_cache, _news_fetch_time
+    now  = datetime.now()
+    last = _news_fetch_time.get(sport)
+    if last and (now - last).seconds < 1800:
+        return _news_cache.get(sport, [])
+
+    url = ESPN_NEWS_URLS.get(sport)
+    if not url:
+        return []
+    try:
+        r = requests.get(url, params={"limit": 60}, headers=_ESPN_HEADERS, timeout=10)
+        if r.status_code != 200:
+            return _news_cache.get(sport, [])
+        articles = r.json().get("articles", [])
+    except Exception as e:
+        print(f"[news] {sport} fetch error: {e}")
+        return _news_cache.get(sport, [])
+
+    news_items = []
+    cutoff = now - timedelta(hours=48)
+
+    for article in articles:
+        headline    = article.get("headline", "")
+        description = (article.get("description") or "")[:250]
+        pub_str     = article.get("published", "")
+
+        # Parse age
+        try:
+            pub = datetime.fromisoformat(pub_str.replace("Z", "").split("+")[0])
+            if pub < cutoff:
+                continue
+            age_hours = max(0, int((now - pub).total_seconds() // 3600))
+        except Exception:
+            age_hours = 99
+
+        # Relevance check
+        text     = (headline + " " + description).lower()
+        relevant = any(kw in text for kw in BETTING_KEYWORDS)
+
+        # Extract team names from categories array
+        teams = []
+        for cat in article.get("categories", []):
+            if cat.get("type") in ("team", "league"):
+                name = cat.get("description", "")
+                if name and name not in teams:
+                    teams.append(name)
+        for t in article.get("teams", []):
+            name = t.get("displayName") or t.get("name", "")
+            if name and name not in teams:
+                teams.append(name)
+
+        news_items.append({
+            "headline":    headline,
+            "description": description,
+            "teams":       teams,
+            "age_hours":   age_hours,
+            "relevant":    relevant,
+        })
+
+    _news_cache[sport]      = news_items
+    _news_fetch_time[sport] = now
+    rel = sum(1 for n in news_items if n["relevant"])
+    print(f"[news] {sport}: {len(news_items)} articles, {rel} betting-relevant")
+    return news_items
+
+
+def get_team_news_note(team_name, sport="NBA", max_items=2):
+    """
+    Return a formatted news string for a team — only betting-relevant items
+    from the last 24 hours, most recent first.
+    """
+    news  = fetch_espn_news(sport)
+    tlow  = team_name.lower()
+    tword = team_name.split()[-1].lower()
+
+    relevant = []
+    for item in news:
+        if not item.get("relevant"):
+            continue
+        if item["age_hours"] > 24:
+            continue
+        # Match on team list or headline text
+        team_hit = any(
+            tlow in t.lower() or tword == t.lower().split()[-1]
+            for t in item["teams"]
+        ) if item["teams"] else (
+            tlow in item["headline"].lower() or tword in item["headline"].lower()
+        )
+        if team_hit:
+            relevant.append(item)
+
+    relevant.sort(key=lambda x: x["age_hours"])
+    notes = []
+    for item in relevant[:max_items]:
+        age = item["age_hours"]
+        age_str = f"{age}h ago" if age > 0 else "just now"
+        notes.append(f"📰 {item['headline']} ({age_str})")
+    return " · ".join(notes)
+
+
 def fetch_mlb_picks():
     """
     MLB game total picks using enhanced model:
@@ -1303,6 +1437,7 @@ def fetch_mlb_picks():
             "matchup":     matchup,
             "reason":      reason,
             "injury_note": injury_note,
+            "news_note":   get_team_news_note(home, "MLB") or get_team_news_note(away, "MLB"),
         })
 
     picks += fetch_mlb_prop_picks()
@@ -1392,6 +1527,7 @@ def fetch_game_picks(sport_key, sport_label):
                     "imp_over":   round(best_imp_over  * 100, 1),
                     "imp_under":  round(best_imp_under * 100, 1),
                     "matchup":    matchup,
+                    "news_note":  get_team_news_note(home, sport_label) or get_team_news_note(away, sport_label),
                 })
 
         # ── Moneyline (h2h) ──
@@ -1726,6 +1862,20 @@ def injuries_debug():
         "fetched_at": _injury_fetch_time.isoformat() if _injury_fetch_time else None,
         "injuries": unique,
     })
+
+@app.route("/api/news")
+def api_news():
+    """Debug: show ESPN news for all sports."""
+    sport = request.args.get("sport", "NBA").upper()
+    items = fetch_espn_news(sport)
+    relevant = [i for i in items if i.get("relevant")]
+    return jsonify({
+        "sport": sport,
+        "total": len(items),
+        "relevant": len(relevant),
+        "items": relevant[:20],
+    })
+
 
 @app.route("/api/debug-mlb")
 def debug_mlb():
