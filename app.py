@@ -340,32 +340,38 @@ def fetch_nba_injuries():
             return _injury_cache  # serve stale if available
 
         raw = r.json()
-        # ESPN may return a list or {"injuries": [...]}
-        entries = raw if isinstance(raw, list) else raw.get("injuries", raw.get("data", []))
+        # ESPN returns {"injuries": [...team entries...], "season": ..., ...}
+        # Each team entry: {"id": "1", "displayName": "Atlanta Hawks", "injuries": [...]}
+        entries = raw.get("injuries", []) if isinstance(raw, dict) else raw
 
         injuries = {}
         for entry in entries:
-            team_info = entry.get("team", {})
-            team_display = team_info.get("displayName", "")
-            team_short   = team_info.get("name", "")  # e.g. "Celtics"
-            team_abbrev  = team_info.get("abbreviation", "")
+            # Team name is directly on the entry, not nested under "team"
+            team_display = entry.get("displayName", "")
+            # Derive short name (last word) e.g. "Hawks" from "Atlanta Hawks"
+            team_short = team_display.split()[-1] if team_display else ""
 
             team_injuries = []
             for inj in entry.get("injuries", []):
+                # Player name: try athlete.displayName, then athlete.fullName, then shortName
                 athlete = inj.get("athlete", {})
-                player  = athlete.get("displayName", "")
-                status  = inj.get("status", "")
+                player  = (athlete.get("displayName") or
+                           athlete.get("fullName") or
+                           athlete.get("shortName") or
+                           inj.get("displayName", ""))
+                # Status: try status field, then type.description
+                status  = (inj.get("status") or
+                           inj.get("type", {}).get("description", ""))
                 comment = inj.get("shortComment") or inj.get("longComment", "")
                 if player and status:
                     team_injuries.append({
                         "player":  player,
-                        "status":  status,   # "Out", "Questionable", "Doubtful", "Probable"
+                        "status":  status,
                         "comment": comment,
                     })
 
             if team_injuries:
-                # Index by every form of the team name for easy lookup
-                for key in [team_display, team_short, team_abbrev]:
+                for key in [team_display, team_short]:
                     if key:
                         injuries[key] = team_injuries
 
