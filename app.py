@@ -15,6 +15,7 @@ try:
 except ImportError:
     pass  # dotenv optional — env vars can be set directly
 import math
+import re
 import requests
 from math import erf, sqrt
 from datetime import datetime, timedelta
@@ -1183,7 +1184,7 @@ def fetch_espn_news(sport="NBA"):
 
         # Relevance check
         text     = (headline + " " + description).lower()
-        relevant = any(kw in text for kw in BETTING_KEYWORDS)
+        relevant = any(re.search(r'\b' + re.escape(kw) + r'\b', text) for kw in BETTING_KEYWORDS)
 
         # Extract team names from categories array
         teams = []
@@ -1925,7 +1926,7 @@ def start_scheduler():
         scheduler.add_job(refresh_cache, "cron", hour=hour, minute=0)
     scheduler.start()
     print("[scheduler] started -- refreshing at 4am, 8am, 12pm, 4pm, 6pm PT")
-    refresh_cache()  # runs load_all_team_scoring() and load_all_mlb_scoring() internally
+    refresh_cache()
 
 import os
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
