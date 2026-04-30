@@ -1391,6 +1391,9 @@ def fetch_mlb_picks():
 
         if not totals.get("over_prices") or not totals.get("under_prices"):
             continue
+        # Require at least 2 books on each side — single-book lines are unreliable
+        if len(totals["over_prices"]) < 2 or len(totals["under_prices"]) < 2:
+            continue
 
         line = totals["line"]
         best_over  = max(totals["over_prices"])
@@ -1401,11 +1404,15 @@ def fetch_mlb_picks():
         true_over  = raw_cons_over  / total_vig
         true_under = raw_cons_under / total_vig
 
-        model_p_over  = normal_over(proj_total, MLB_TOTAL_STD, line)
-        model_p_under = 1.0 - model_p_over
-
         best_imp_over  = american_to_implied(best_over)
         best_imp_under = american_to_implied(best_under)
+
+        # Skip if best book is an outlier (>25pp off consensus — lone mispricing)
+        if abs(best_imp_over - raw_cons_over) > 0.25 or abs(best_imp_under - raw_cons_under) > 0.25:
+            continue
+
+        model_p_over  = normal_over(proj_total, MLB_TOTAL_STD, line)
+        model_p_under = 1.0 - model_p_over
 
         edge_over  = round(model_p_over  - true_over,  4)
         edge_under = round(model_p_under - true_under, 4)
@@ -1491,7 +1498,8 @@ def fetch_game_picks(sport_key, sport_label):
                     elif side == "Under":
                         totals.setdefault("under_prices", []).append(price)
 
-        if totals.get("over_prices") and totals.get("under_prices"):
+        if (totals.get("over_prices") and totals.get("under_prices") and
+                len(totals["over_prices"]) >= 2 and len(totals["under_prices"]) >= 2):
             best_over  = max(totals["over_prices"])
             best_under = max(totals["under_prices"])
             # Average IMPLIED probabilities (not raw odds) for accurate consensus
@@ -1503,6 +1511,9 @@ def fetch_game_picks(sport_key, sport_label):
             true_under     = raw_cons_under / total_vig
             best_imp_over  = american_to_implied(best_over)
             best_imp_under = american_to_implied(best_under)
+            # Skip outlier lone-book mispricing (>25pp off consensus)
+            if abs(best_imp_over - raw_cons_over) > 0.25 or abs(best_imp_under - raw_cons_under) > 0.25:
+                continue
             # Edge = best book implied minus de-vigged true probability
             edge_over  = round(best_imp_over  - true_over,  4)
             edge_under = round(best_imp_under - true_under, 4)
