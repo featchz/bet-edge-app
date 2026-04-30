@@ -1083,6 +1083,39 @@ def raw():
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
 
+@app.route("/api/espn-raw")
+def espn_raw():
+    """Debug: show raw ESPN injury API response so we can fix the parser."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
+            headers=headers, timeout=10
+        )
+        raw = r.json() if r.status_code == 200 else {}
+        # Show structure: top-level keys and first entry shape
+        if isinstance(raw, list):
+            shape = "list"
+            sample = raw[:2] if raw else []
+        elif isinstance(raw, dict):
+            shape = "dict"
+            sample = {k: str(v)[:200] for k, v in list(raw.items())[:5]}
+        else:
+            shape = type(raw).__name__
+            sample = str(raw)[:300]
+        return jsonify({
+            "status": r.status_code,
+            "top_level_type": shape,
+            "sample": sample,
+            "total_entries": len(raw) if isinstance(raw, (list, dict)) else "n/a",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/api/debug-bdl")
 def debug_bdl():
     """Debug: test BDL team lookup and game fetch for one team."""
