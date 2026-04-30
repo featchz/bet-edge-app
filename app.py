@@ -38,16 +38,21 @@ def cache_is_fresh():
 def refresh_cache():
     """
     Credit-efficient refresh — 3 Odds API calls per refresh.
-    BDL is 1 bulk call (all teams at once) to avoid rate limits.
+    BDL/MLB Stats are free bulk calls (no rate limit issues).
     """
-    load_all_team_scoring()   # 1 BDL call — builds scoring for all 30 teams
+    load_all_team_scoring()   # 1 BDL call — builds NBA scoring for all 30 teams
+    load_all_mlb_scoring()    # 1 MLB Stats API call — builds MLB scoring for all teams
     raw = []
-    nba = fetch_nba_picks()  # Smart model: team scoring + stats
+    nba = fetch_nba_picks()   # Smart model: team scoring + stats
     if not nba:
         print("[cache] NBA team model returned empty — falling back to market comparison")
         nba = fetch_game_picks("basketball_nba", "NBA")
     raw += nba
-    raw += fetch_game_picks("baseball_mlb",   "MLB")
+    mlb = fetch_mlb_picks()   # Smart model: team run scoring + pitcher ERA
+    if not mlb:
+        print("[cache] MLB team model returned empty — falling back to market comparison")
+        mlb = fetch_game_picks("baseball_mlb", "MLB")
+    raw += mlb
     raw += fetch_game_picks("icehockey_nhl",  "NHL")
 
     # Deduplicate — keep only the best-edge side per game+market
@@ -786,6 +791,295 @@ def fetch_nba_picks():
     return picks
 
 
+
+# ── MLB Team Scoring Model ────────────────────────────────────────────────
+MLB_STATS_BASE   = "https://statsapi.mlb.com/api/v1"
+MLB_AVG_ERA      = 4.20   # league-average ERA for pitcher adjustment
+MLB_TOTAL_STD    = 2.8    # std dev for run total normal distribution
+
+_mlb_team_cache      = {}   # team_name -> {"scored": float, "allowed": float, "games": int}
+_mlb_team_cache_time = None
+_mlb_pitcher_cache   = {}   # pitcher_id -> era float
+
+
+def load_all_mlb_scoring():
+    """
+    Fetches last 20 days of MLB schedule (1 free API call) and builds
+    per-team run scoring/allowed averages. No API key required.
+    """
+    global _mlb_team_cache, _mlb_team_cache_time
+    today = datetime.now()
+    start = (today - timedelta(days=20)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
+    try:
+        r = requests.get(
+            f"{MLB_STATS_BASE}/schedule",
+            params={"sportId": 1, "startDate": start, "endDate": end,
+                    "gameType": "R,F,D,L,W"},
+            timeout=15
+        )
+        if r.status_code != 200:
+            print(f"[MLB] schedule fetch failed: {r.status_code}")
+            return
+        data = r.json()
+    except Exception as e:
+        print(f"[MLB] load_all_mlb_scoring error: {e}")
+        return
+
+    team_stats = {}
+    for date_entry in data.get("dates", []):
+        for game in date_entry.get("games", []):
+            home       = game.get("teams", {}).get("home", {})
+            away       = game.get("teams", {}).get("away", {})
+            home_name  = home.get("team", {}).get("name", "")
+            away_name  = away.get("team", {}).get("name", "")
+            home_score = home.get("score")
+            away_score = away.get("score")
+            if home_score is None or away_score is None:
+                continue
+            try:
+                home_score = int(home_score)
+                away_score = int(away_score)
+            except (TypeError, ValueError):
+                continue
+            for name, scored, allowed in [
+                (home_name, home_score, away_score),
+                (away_name, away_score, home_score),
+            ]:
+                if not name:
+                    continue
+                if name not in team_stats:
+                    team_stats[name] = {"scored": [], "allowed": []}
+                team_stats[name]["scored"].append(scored)
+                team_stats[name]["allowed"].append(allowed)
+
+    new_cache = {}
+    for name, stats in team_stats.items():
+        if stats["scored"]:
+            new_cache[name] = {
+                "scored":  round(sum(stats["scored"])  / len(stats["scored"]),  2),
+                "allowed": round(sum(stats["allowed"]) / len(stats["allowed"]), 2),
+                "games":   len(stats["scored"]),
+            }
+
+    _mlb_team_cache      = new_cache
+    _mlb_team_cache_time = datetime.now()
+    print(f"[MLB] loaded scoring for {len(new_cache)} teams ({start} → {end})")
+
+
+def get_mlb_team_scoring(team_name):
+    """Look up pre-built MLB team scoring. Falls back to league average."""
+    if team_name in _mlb_team_cache:
+        return _mlb_team_cache[team_name]
+    for cached_name, stats in _mlb_team_cache.items():
+        if team_name.split()[-1] == cached_name.split()[-1]:
+            return stats
+    return {"scored": 4.5, "allowed": 4.5, "games": 0}
+
+
+def get_pitcher_era(pitcher_id):
+    """Fetch current-season ERA for a pitcher from MLB Stats API."""
+    if pitcher_id in _mlb_pitcher_cache:
+        return _mlb_pitcher_cache[pitcher_id]
+    try:
+        r = requests.get(
+            f"{MLB_STATS_BASE}/people/{pitcher_id}/stats",
+            params={"stats": "season", "group": "pitching",
+                    "season": datetime.now().year},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return MLB_AVG_ERA
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+        if splits:
+            era_str = splits[-1].get("stat", {}).get("era", str(MLB_AVG_ERA))
+            try:
+                era = float(era_str)
+                if era <= 0:
+                    era = MLB_AVG_ERA
+            except (TypeError, ValueError):
+                era = MLB_AVG_ERA
+            _mlb_pitcher_cache[pitcher_id] = era
+            return era
+    except Exception:
+        pass
+    return MLB_AVG_ERA
+
+
+def project_mlb_total(home_team, away_team, home_era, away_era):
+    """
+    Project total runs for a game.
+    Home runs = avg(home_scored, away_allowed) adjusted by away pitcher ERA.
+    Away runs = avg(away_scored, home_allowed) adjusted by home pitcher ERA.
+    """
+    home_scoring = get_mlb_team_scoring(home_team)
+    away_scoring = get_mlb_team_scoring(away_team)
+    # Lower ERA pitcher suppresses offense more
+    away_pitcher_factor = min(max(MLB_AVG_ERA / away_era, 0.6), 1.5)
+    home_pitcher_factor = min(max(MLB_AVG_ERA / home_era, 0.6), 1.5)
+    home_proj = ((home_scoring["scored"] + away_scoring["allowed"]) / 2) * away_pitcher_factor
+    away_proj = ((away_scoring["scored"] + home_scoring["allowed"]) / 2) * home_pitcher_factor
+    return round(home_proj + away_proj, 2)
+
+
+def fetch_mlb_picks():
+    """
+    MLB game total picks using team scoring model + probable pitcher ERA.
+    Uses free MLB Stats API for projections, Odds API for lines/odds.
+    Falls back to market-comparison if model data is unavailable.
+    """
+    if not _mlb_team_cache:
+        load_all_mlb_scoring()
+
+    picks = []
+    try:
+        r = requests.get(
+            f"{ODDS_API_BASE}/sports/baseball_mlb/odds",
+            params={"apiKey": ODDS_API_KEY, "regions": "us",
+                    "markets": "h2h,totals", "oddsFormat": "american"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return fetch_game_picks("baseball_mlb", "MLB")
+        games = r.json()
+    except Exception:
+        return fetch_game_picks("baseball_mlb", "MLB")
+
+    if not games:
+        return []
+
+    # Fetch today's probable pitchers in one call
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    pitcher_map = {}  # (home_lower, away_lower) -> (home_era, away_era, home_name, away_name)
+    try:
+        rs = requests.get(
+            f"{MLB_STATS_BASE}/schedule",
+            params={"sportId": 1, "date": today_str,
+                    "hydrate": "probablePitcher", "gameType": "R,F,D,L,W"},
+            timeout=10
+        )
+        if rs.status_code == 200:
+            for date_entry in rs.json().get("dates", []):
+                for game in date_entry.get("games", []):
+                    h_name    = game.get("teams", {}).get("home", {}).get("team", {}).get("name", "")
+                    a_name    = game.get("teams", {}).get("away", {}).get("team", {}).get("name", "")
+                    h_pitcher = game.get("teams", {}).get("home", {}).get("probablePitcher", {})
+                    a_pitcher = game.get("teams", {}).get("away", {}).get("probablePitcher", {})
+                    h_era     = get_pitcher_era(h_pitcher["id"]) if h_pitcher.get("id") else MLB_AVG_ERA
+                    a_era     = get_pitcher_era(a_pitcher["id"]) if a_pitcher.get("id") else MLB_AVG_ERA
+                    key = (h_name.lower(), a_name.lower())
+                    pitcher_map[key] = (h_era, a_era,
+                                        h_pitcher.get("fullName", "TBD"),
+                                        a_pitcher.get("fullName", "TBD"))
+    except Exception as e:
+        print(f"[MLB] today schedule/pitcher fetch error: {e}")
+
+    for game in games:
+        home  = game.get("home_team", "")
+        away  = game.get("away_team", "")
+        books = game.get("bookmakers", [])
+        if not books:
+            continue
+
+        matchup = f"{away} @ {home}"
+
+        # Pitcher lookup — exact then fuzzy on last word
+        pit_key = (home.lower(), away.lower())
+        if pit_key in pitcher_map:
+            home_era, away_era, home_pitcher, away_pitcher = pitcher_map[pit_key]
+        else:
+            home_era, away_era, home_pitcher, away_pitcher = MLB_AVG_ERA, MLB_AVG_ERA, "TBD", "TBD"
+            for (h, a), val in pitcher_map.items():
+                if (home.split()[-1].lower() == h.split()[-1] and
+                        away.split()[-1].lower() == a.split()[-1]):
+                    home_era, away_era, home_pitcher, away_pitcher = val
+                    break
+
+        proj_total   = project_mlb_total(home, away, home_era, away_era)
+        home_scoring = get_mlb_team_scoring(home)
+        away_scoring = get_mlb_team_scoring(away)
+
+        reason = (f"Model: {proj_total} runs · "
+                  f"{home.split()[-1]} {home_scoring['scored']:.1f} R/G · "
+                  f"{away.split()[-1]} {away_scoring['scored']:.1f} R/G")
+        if home_pitcher != "TBD" or away_pitcher != "TBD":
+            h_note = f"{home_pitcher} ({home_era:.2f})" if home_pitcher != "TBD" else "TBD"
+            a_note = f"{away_pitcher} ({away_era:.2f})" if away_pitcher != "TBD" else "TBD"
+            reason += f" · SP: {h_note} vs {a_note}"
+
+        # Parse totals
+        totals = {}
+        for book in books:
+            for mkt in book.get("markets", []):
+                if mkt.get("key") != "totals":
+                    continue
+                for outcome in mkt.get("outcomes", []):
+                    side  = outcome.get("name")
+                    price = outcome.get("price", 0)
+                    line  = outcome.get("point", 0)
+                    if side == "Over":
+                        totals.setdefault("over_prices", []).append(price)
+                        totals["line"] = line
+                    elif side == "Under":
+                        totals.setdefault("under_prices", []).append(price)
+
+        if not totals.get("over_prices") or not totals.get("under_prices"):
+            continue
+
+        line = totals["line"]
+        best_over  = max(totals["over_prices"])
+        best_under = max(totals["under_prices"])
+        raw_cons_over  = sum(american_to_implied(p) for p in totals["over_prices"])  / len(totals["over_prices"])
+        raw_cons_under = sum(american_to_implied(p) for p in totals["under_prices"]) / len(totals["under_prices"])
+        total_vig  = raw_cons_over + raw_cons_under
+        true_over  = raw_cons_over  / total_vig
+        true_under = raw_cons_under / total_vig
+
+        # Model probabilities from normal distribution
+        model_p_over  = normal_over(proj_total, MLB_TOTAL_STD, line)
+        model_p_under = 1.0 - model_p_over
+
+        best_imp_over  = american_to_implied(best_over)
+        best_imp_under = american_to_implied(best_under)
+
+        edge_over  = round(model_p_over  - true_over,  4)
+        edge_under = round(model_p_under - true_under, 4)
+
+        best_side = "OVER" if edge_over > edge_under else "UNDER"
+        best_edge = max(edge_over, edge_under)
+
+        if best_edge < GAME_EDGE_THRESHOLD:
+            continue
+
+        best_odds = best_over if best_side == "OVER" else best_under
+        true_p    = true_over if best_side == "OVER" else true_under
+
+        picks.append({
+            "player":     matchup,
+            "stat":       "Game Total",
+            "sport":      "MLB",
+            "line":       line,
+            "projection": proj_total,
+            "best_side":  best_side,
+            "edge":       round(best_edge * 100, 1),
+            "ev":         ev_calc(true_p, best_odds),
+            "strength":   "strong" if best_edge >= STRONG_THRESHOLD else "value",
+            "over_odds":  best_over,
+            "under_odds": best_under,
+            "p_over":     round(model_p_over  * 100, 1),
+            "p_under":    round(model_p_under * 100, 1),
+            "imp_over":   round(best_imp_over  * 100, 1),
+            "imp_under":  round(best_imp_under * 100, 1),
+            "matchup":    matchup,
+            "reason":     reason,
+        })
+
+    # Append prop picks
+    picks += fetch_mlb_prop_picks()
+    picks.sort(key=lambda x: x["edge"], reverse=True)
+    return picks
+
+
 # ── Game-level picks (moneyline + totals) for any sport ──────────────────
 def fetch_game_picks(sport_key, sport_label):
     """
@@ -1195,6 +1489,21 @@ def injuries_debug():
         "fetched_at": _injury_fetch_time.isoformat() if _injury_fetch_time else None,
         "injuries": unique,
     })
+
+@app.route("/api/debug-mlb")
+def debug_mlb():
+    """Debug: show MLB team scoring cache and pitcher data."""
+    load_all_mlb_scoring()
+    sample_teams = ["New York Yankees", "Los Angeles Dodgers", "Atlanta Braves",
+                    "Houston Astros", "Boston Red Sox", "Chicago Cubs"]
+    team_data = {t: get_mlb_team_scoring(t) for t in sample_teams}
+    return jsonify({
+        "teams_loaded": len(_mlb_team_cache),
+        "cache_time": _mlb_team_cache_time.isoformat() if _mlb_team_cache_time else None,
+        "sample_teams": team_data,
+        "all_teams": dict(sorted(_mlb_team_cache.items())),
+    })
+
 
 @app.route("/api/debug")
 def debug():
